@@ -1,0 +1,47 @@
+### DataFrame API ###
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import when, col, count
+import time
+
+# Measure the full execution time
+start_time = time.time()
+
+# Create a SparkSession
+spark = SparkSession.builder \
+    .appName("Query 1") \
+    .getOrCreate()
+
+# Read both CSV files into DataFrames
+crime_data_2010_2019 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2020_present = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read both CSV files into DataFrames
+crime_df_2010_2019 = spark.read.csv(crime_data_2010_2019, header=True, inferSchema=True)
+crime_df_2020_present = spark.read.csv(crime_data_2020_present, header=True, inferSchema=True)
+
+# Combine the two DataFrames and remove duplicates
+crime_data = crime_df_2010_2019.union(crime_df_2020_present).dropDuplicates()
+
+# Filter records for "AGGRAVATED ASSAULT" in the column "Crm Cd Desc"
+filtered_data = crime_data.filter(col("Crm Cd Desc").contains("AGGRAVATED ASSAULT"))
+
+# Add a new column for age groups based on "Vict Age"
+filtered_data = filtered_data.withColumn(
+    "Age Group",
+    when(col("Vict Age") < 18, "Children (<18)") \
+    .when((col("Vict Age") >= 18) & (col("Vict Age") <= 24), "Young adults (18-24)") \
+    .when((col("Vict Age") >= 25) & (col("Vict Age") <= 64), "Adults (25-64)") \
+    .when(col("Vict Age") > 64, "Elderly (>64)") \
+    .otherwise("Not Known")
+)
+
+# Group by "Age Group" and count occurrences, then sort by count in descending order
+age_group_counts = filtered_data.groupBy("Age Group").agg(count("*").alias("Count")).orderBy(col("Count").desc())
+
+# Trigger Spark execution and display results
+age_group_counts.show()  
+
+# Measure total execution time
+end_time = time.time()
+print(f"DataFrame API took: {end_time - start_time:.2f} seconds")
