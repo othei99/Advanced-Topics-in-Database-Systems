@@ -1,0 +1,66 @@
+### DataFrame API ###
+
+import time
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import count, sum, col, row_number, format_number, when, year, to_timestamp
+from pyspark.sql.window import Window
+
+# Start the timer
+start_time = time.time()
+
+# Create SparkSession
+spark = SparkSession.builder \
+    .appName("Query 2") \
+    .getOrCreate()
+
+# Read both CSV files into DataFrames
+crime_data_2010_2019 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2020_present = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read both CSV files into DataFrames
+crime_df_2010_2019 = spark.read.csv(crime_data_2010_2019, header=True, inferSchema=True)
+crime_df_2020_present = spark.read.csv(crime_data_2020_present, header=True, inferSchema=True)
+
+# Combine the two DataFrames and remove duplicates
+crime_data = crime_df_2010_2019.union(crime_df_2020_present).dropDuplicates()
+
+# Convert DATE OCC to timestamp format and extract the year
+crime_data = crime_data.withColumn("DATE OCC", to_timestamp(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a"))
+crime_data = crime_data.withColumn("Year", year(col("DATE OCC")))
+
+# Drop rows where Year is null (if any)
+crime_data = crime_data.filter(col("Year").isNotNull())
+
+# Proceed with the rest of the calculations
+case_stats = crime_data.groupBy("Year", "AREA NAME").agg(
+    count("*").alias("total_cases"),
+    sum((col("Status") != "IC").cast("int")).alias("cases_closed")
+)
+
+case_stats = case_stats.withColumn(
+    "closed_case_rate",
+    (col("cases_closed") / col("total_cases")) * 100
+)
+
+window_spec = Window.partitionBy("Year").orderBy(col("closed_case_rate").desc())
+
+case_stats = case_stats.withColumn("rank", row_number().over(window_spec))
+
+top_precincts = case_stats.filter(col("rank") <= 3).orderBy("Year", "rank")
+
+years = top_precincts.select("Year").distinct().rdd.flatMap(lambda x: x).collect()
+
+yearly_tables = {}
+for year in years:
+    yearly_tables[year] = top_precincts.filter(col("Year") == year)
+    print(f"Top 3 for Year {year}:")
+    yearly_tables[year] \
+        .select(
+            col("Year"),
+            col("AREA NAME").alias("precinct"),
+            col("closed_case_rate"),
+            col("rank").alias("#")
+        ).show(truncate=False)
+
+end_time = time.time()
+print(f"DataFrame API took : {end_time - start_time:.2f} seconds")
