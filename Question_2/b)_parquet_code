@@ -1,0 +1,63 @@
+# S3-path
+output_path_s3 = "s3://groups-bucket-dblab-905418150721/group52/main_data_set.parquet"
+
+# Write to S3
+try:
+    crime_data.write.mode("overwrite").parquet(output_path_s3)
+    print(f"DataFrame writed successfully to S3: {output_path_s3}")
+except Exception as e:
+    print(f"Error writing to S3: {e}")
+
+### Parquet ###
+# Start the timer
+start_time = time.time()
+
+# Download Parquet file 
+parquet_path = "s3://groups-bucket-dblab-905418150721/group52/main_data_set.parquet/"
+crime_data = spark.read.parquet(parquet_path)
+
+# Group data by year and area to calculate total cases and closed cases
+case_stats = crime_data.groupBy("Year", "AREA NAME").agg(
+    # Count total cases per year and area
+    count("*").alias("total_cases"),
+    
+    # Count closed cases where Status is NOT "IC" (Invest Cont)
+    sum((col("Status") != "IC").cast("int")).alias("cases_closed")
+)
+
+# Calculate the closed case rate as a percentage
+case_stats = case_stats.withColumn(
+    "closed_case_rate",
+    (col("cases_closed") / col("total_cases")) * 100
+)
+
+# Define a window specification for ranking precincts within each year
+window_spec = Window.partitionBy("Year").orderBy(col("closed_case_rate").desc())
+
+# Add a rank column to rank precincts based on closed case rate
+case_stats = case_stats.withColumn("rank", row_number().over(window_spec))
+
+# Filter the top 3 precincts for each year
+top_precincts = case_stats.filter(col("rank") <= 3).orderBy("Year", "rank")
+
+# Create separate DataFrames for each year
+years = top_precincts.select("Year").distinct().rdd.flatMap(lambda x: x).collect()  # Collect all unique years
+yearly_tables = {}
+
+for year in years:
+    # Filter the top 3 precincts for the specific year
+    yearly_tables[year] = top_precincts.filter(col("Year") == year)
+    
+    # Print the results for the specific year with renamed columns
+    print(f"Top 3 for Year {year}:")
+    yearly_tables[year] \
+        .select(
+            col("Year"),
+            col("AREA NAME").alias("precinct"),  
+            col("closed_case_rate"),
+            col("rank").alias("#")  
+        ).show(truncate=False)
+
+# Stop the timer and print the total execution time
+end_time = time.time()
+print(f"Execution time: {end_time - start_time:.2f} seconds")
