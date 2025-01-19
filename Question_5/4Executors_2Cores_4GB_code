@@ -1,0 +1,74 @@
+### 4 Executors × 2 Cores/4GB Memory ###
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, expr, row_number, round
+from pyspark.sql.window import Window
+from sedona.sql.types import GeometryType
+from sedona.register.geo_registrator import SedonaRegistrator
+import time
+
+start_time = time.time()
+
+# Paths to data
+crime_data_2010_2019 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2020_present = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+police_stations_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+
+# Initialize SparkSession 
+spark = SparkSession.builder \
+    .appName("Query 5 - 4 Executors × 2 Cores/4GB Memory") \
+    .config("spark.executor.instances", 4) \
+    .config("spark.executor.cores", 2) \
+    .config("spark.executor.memory", "4g") \
+    .getOrCreate()
+
+SedonaRegistrator.registerAll(spark)
+
+# Load and clean crime data
+crime_df_2010_2019 = spark.read.csv(crime_data_2010_2019, header=True, inferSchema=True)
+crime_df_2020_present = spark.read.csv(crime_data_2020_present, header=True, inferSchema=True)
+crime_data = crime_df_2010_2019.union(crime_df_2020_present).dropDuplicates()
+crime_data = crime_data.filter((col("LAT") != 0) & (col("LON") != 0))
+crime_data = crime_data.filter(col("LAT").isNotNull() & col("LON").isNotNull())
+
+# Load and clean police stations data
+police_stations_df = spark.read.csv(police_stations_path, header=True, inferSchema=True)
+police_stations_df = police_stations_df.filter(col("X").isNotNull() & col("Y").isNotNull())
+
+# Create geometry columns
+crime_data = crime_data.withColumn("crime_geometry", expr("ST_Point(LON, LAT)"))
+police_stations_df = police_stations_df.withColumn("station_geometry", expr("ST_Point(X, Y)"))
+
+# Prepare police stations broadcast dataframe
+police_stations_broadcast = police_stations_df.select(
+    col("station_geometry"),
+    col("DIVISION").alias("division")
+)
+
+# Perform spatial join
+joined_df = crime_data.crossJoin(police_stations_broadcast) \
+    .withColumn("distance", expr("ST_Distance(crime_geometry, station_geometry)")) \
+    .withColumn("distance_km", col("distance") * 111.32)
+
+# Select the nearest police station for each crime
+window_spec = Window.partitionBy("DR_NO").orderBy("distance_km")
+nearest_station_df = joined_df.withColumn("rank", row_number().over(window_spec)) \
+                              .filter(col("rank") == 1)
+
+# Aggregate results
+result = nearest_station_df.groupBy("division") \
+    .agg(
+        round(avg("distance_km"), 3).alias("average_distance"),
+        count("DR_NO").alias("#")
+    ) \
+    .orderBy(col("#").desc())
+
+# Show results
+result.show(truncate=False)
+execution_time = time.time() - start_time
+
+# Print execution time
+print(f"Execution Time (4 Executors x 2 Cores/4GB Memory): {execution_time:.2f} seconds")
+
+# Stop SparkSession
+spark.stop()
