@@ -1,0 +1,96 @@
+from pyspark.sql import SparkSession
+from sedona.register.geo_registrator import SedonaRegistrator
+from sedona.sql.types import GeometryType
+from pyspark.sql.functions import col, regexp_replace, explode, count, sum, concat, lit, expr, to_timestamp, year
+import time
+
+# Create a Spark session and register Sedona
+spark = SparkSession.builder \
+    .appName("SHUFFLE_REPLICATE_NL") \
+    .getOrCreate()
+
+# Register Sedona
+SedonaRegistrator.registerAll(spark)
+
+# Load census data from a GeoJSON file
+census_blocks_path = "s3://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+census_raw_df = spark.read.format("geojson").option("multiline", "true").load(census_blocks_path)
+
+# Extract the features field and select geometry and attributes
+census_df = census_raw_df.select(explode(col("features")).alias("feature")) \
+    .select(
+        col("feature.geometry").cast(GeometryType()).alias("census_geometry"),
+        col("feature.properties.ZCTA10").alias("zip"),
+        col("feature.properties.POP_2010").alias("population")
+    ).filter(col("population").isNotNull())
+
+# Load crime data from a CSV file
+crime_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_df = spark.read.csv(crime_data_path, header=True, inferSchema=True)
+
+# Convert "DATE OCC" to a timestamp and filter for crimes that occurred in 2010
+crime_df = crime_df.withColumn("DATE_OCC_TIMESTAMP", to_timestamp(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a"))
+crime_df = crime_df.filter(year(col("DATE_OCC_TIMESTAMP")) == 2010)
+
+# Create a geometry column from the LAT and LON fields in the crime data
+crime_df = crime_df.withColumn("crime_geometry", expr("ST_Point(LON, LAT)"))
+
+# Perform a spatial join between crime data and census data
+joined_df = crime_df.join(census_df, expr("ST_Intersects(crime_geometry, census_geometry)"), "inner")
+
+# Aggregate census data by ZIP code
+aggregated_population = census_df.groupBy("zip").agg(sum("population").alias("population (2010)"))
+
+# Calculate the total number of crimes by ZIP code
+crime_counts = joined_df.groupBy("zip").agg(count("LOCATION").alias("crimes (2010)"))
+
+# Measure the performance of the SHUFFLE_REPLICATE_NL join
+start_time = time.time()
+
+# Use SHUFFLE_REPLICATE_NL join to combine crime and population data
+crime_ratio_df = crime_counts.join(
+    aggregated_population.hint("shuffle_replicate_nl"),
+    "zip",
+    "inner"
+)
+
+# Filter out rows where population is NULL or 0
+crime_ratio_df = crime_ratio_df.filter((col("population (2010)").isNotNull()) & (col("population (2010)") > 0))
+
+# Calculate the crime-to-population ratio
+crime_ratio_df = crime_ratio_df.withColumn("crimes_per_person (2010)", col("crimes (2010)") / col("population (2010)"))
+
+# Load income data
+income_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+tulo_df = spark.read.csv(income_path, header=True, inferSchema=True)
+
+# Clean the Estimated Median Income column and convert it to a numeric format
+tulo_df = tulo_df.withColumn("zip", col("Zip Code").cast("string")) \
+    .withColumn("income_cleaned", regexp_replace(regexp_replace(col("Estimated Median Income"), "\\$", ""), ",", "")) \
+    .withColumn("estimated_median_income (2015)", col("income_cleaned").cast("double"))
+
+# Combine crime, population, and income data
+combined_df = crime_ratio_df.join(
+    tulo_df.select("zip", "estimated_median_income (2015)"),
+    "zip",
+    "inner"
+)
+
+# Calculate the average income per person
+combined_df = combined_df.withColumn("average_income_per_person", col("estimated_median_income (2015)") / col("population (2010)"))
+
+# Add a dollar sign to the average_income_per_person column without rounding
+final_df = combined_df.select(
+    col("zip").alias("zip (LA)"),
+    col("crimes (2010)"),
+    col("population (2010)"),
+    col("crimes_per_person (2010)"),
+    concat(lit("$"), col("estimated_median_income (2015)")).alias("estimated_income (2015)"),
+    concat(lit("$"), col("average_income_per_person")).alias("average_annual_per_person")
+)
+
+# Display the results
+final_df.show(truncate=False)
+
+end_time = time.time()
+print(f"SHUFFLE_REPLICATE_NL Join Time: {end_time - start_time} seconds")
